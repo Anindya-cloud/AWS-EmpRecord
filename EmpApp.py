@@ -1,24 +1,34 @@
+# EmpApp.py  (fixed)
 from flask import Flask, render_template, request
-from pymysql import connections
+import pymysql
 import os
 import boto3
-from config import *
+from config import *   # keep temporarily; move to env vars / secrets in production
 
 app = Flask(__name__)
 
-bucket = custombucket
-region = customregion
+# Use the values from config.py
+BUCKET = custombucket
+REGION = customregion
+DB_HOST = customhost
+DB_USER = customuser
+DB_PASS = custompass
+DB_NAME = customdb
+DB_PORT = 3306
+TABLE = 'employee'
 
-db_conn = connections.Connection(
-    host=customhost,
-    port=3306,
-    user=customuser,
-    password=custompass,
-    db=customdb
 
-)
-output = {}
-table = 'employee'
+def get_db_connection():
+    """Create a new DB connection for each request (safer than a global connection)."""
+    return pymysql.connect(
+        host=DB_HOST,
+        user=DB_USER,
+        password=DB_PASS,
+        db=DB_NAME,
+        port=DB_PORT,
+        cursorclass=pymysql.cursors.DictCursor,
+        autocommit=False
+    )
 
 
 @app.route("/", methods=['GET', 'POST'])
@@ -26,81 +36,95 @@ def home():
     return render_template('AddEmp.html')
 
 
-@app.route("/addemployee", methods=['GET','POST'])
+@app.route("/addemployee", methods=['GET', 'POST'])
 def AddEmployee():
     return render_template('AddEmp.html')
 
-@app.route("/getemployee", methods=['GET','POST'])
+
+@app.route("/getemployee", methods=['GET', 'POST'])
 def GetEmployee():
     return render_template('GetEmp.html')
 
+
 @app.route("/fetchdata", methods=['POST'])
 def GetEmp():
-    emp_id = request.form['emp_id']
-    select_sql = "SELECT * FROM employee where empid= %s"
-    cursor = db_conn.cursor()
+    emp_id = request.form.get('emp_id')
+    select_sql = "SELECT * FROM employee WHERE empid = %s"
+
+    conn = None
     try:
-        cursor.execute(select_sql, (emp_id))
-        myresult = cursor.fetchall()
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            # pass a single-element tuple (note trailing comma)
+            cursor.execute(select_sql, (emp_id,))
+            myresult = cursor.fetchall()
     except Exception as e:
-        return str(e)
+        # for debugging return error text; remove or log in production
+        return f"DB error: {str(e)}"
     finally:
-        cursor.close()
-        # print(myresult)
-    # return ''
-    # return render_template('AddEmpOutput.html', name=emp_name)
-    
-    return render_template('GetEmpOutput.html',name = myresult)
-  
+        if conn:
+            conn.close()
+
+    return render_template('GetEmpOutput.html', name=myresult)
+
+
 @app.route("/addemp", methods=['POST'])
 def AddEmp():
-    emp_id = request.form['emp_id']
-    first_name = request.form['first_name']
-    last_name = request.form['last_name']
-    pri_skill = request.form['pri_skill']
-    location = request.form['location']
-    emp_image_file = request.files['emp_image_file']
+    # get form fields (use .get to avoid KeyError)
+    emp_id = request.form.get('emp_id')
+    first_name = request.form.get('first_name')
+    last_name = request.form.get('last_name')
+    pri_skill = request.form.get('pri_skill')
+    location = request.form.get('location')
+    emp_image_file = request.files.get('emp_image_file')
 
-    insert_sql = "INSERT INTO employee VALUES (%s, %s, %s, %s, %s)"
-    cursor = db_conn.cursor()
-
-    if emp_image_file.filename == "":
+    if not emp_image_file or emp_image_file.filename == "":
         return "Please select a file"
 
-    try:
+    # use explicit column names; adjust if your table columns are named differently
+    insert_sql = """
+        INSERT INTO employee (empid, firstname, lastname, pri_skill, location)
+        VALUES (%s, %s, %s, %s, %s)
+    """
 
-        cursor.execute(insert_sql, (emp_id, first_name, last_name, pri_skill, location))
-        db_conn.commit()
-        emp_name = "" + first_name + " " + last_name
-        # Uplaod image file in S3 #
-        emp_image_file_name_in_s3 = "emp-id-" + str(emp_id) + "_image_file"
-        s3 = boto3.resource('s3')
+    conn = None
+    try:
+        conn = get_db_connection()
+        with conn.cursor() as cursor:
+            cursor.execute(insert_sql, (emp_id, first_name, last_name, pri_skill, location))
+        conn.commit()
+        emp_name = f"{first_name} {last_name}"
+
+        # upload to S3 using upload_fileobj (works with Flask's file object)
+        s3_client = boto3.client('s3', region_name=REGION)
+        emp_image_file.stream.seek(0)
+        s3_key = f"emp-id-{emp_id}_image_file"
 
         try:
-            print("Data inserted in MySQL RDS... uploading image to S3...")
-            s3.Bucket(custombucket).put_object(Key=emp_image_file_name_in_s3, Body=emp_image_file)
-            bucket_location = boto3.client('s3').get_bucket_location(Bucket=custombucket)
-            s3_location = (bucket_location['LocationConstraint'])
-
-            if s3_location is None:
-                s3_location = ''
+            s3_client.upload_fileobj(emp_image_file.stream, BUCKET, s3_key)
+            # build an object URL (region handling)
+            bucket_loc = s3_client.get_bucket_location(Bucket=BUCKET)
+            loc = bucket_loc.get('LocationConstraint')
+            if loc is None:
+                s3_host = "s3.amazonaws.com"
             else:
-                s3_location = '-' + s3_location
-
-            object_url = "https://s3{0}.amazonaws.com/{1}/{2}".format(
-                s3_location,
-                custombucket,
-                emp_image_file_name_in_s3)
-
+                s3_host = f"s3-{loc}.amazonaws.com"
+            object_url = f"https://{s3_host}/{BUCKET}/{s3_key}"
+            print("Uploaded image to:", object_url)
         except Exception as e:
-            return str(e)
+            return f"S3 upload error: {str(e)}"
 
+    except Exception as e:
+        if conn:
+            conn.rollback()
+        return f"DB insert error: {str(e)}"
     finally:
-        cursor.close()
+        if conn:
+            conn.close()
 
-    print("all modification done...")
     return render_template('AddEmpOutput.html', name=emp_name)
 
 
 if __name__ == '__main__':
+    # dev server only
     app.run(host='0.0.0.0', port=8080, debug=True)
