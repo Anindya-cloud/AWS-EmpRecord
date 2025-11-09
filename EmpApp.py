@@ -83,7 +83,7 @@ def AddEmp():
 
     # use explicit column names; adjust if your table columns are named differently
     insert_sql = """
-        INSERT INTO employee (empid, firstname, lastname, pri_skill, location)
+        INSERT INTO employee (empid, fname, lname, pri_skill, location)
         VALUES (%s, %s, %s, %s, %s)
     """
 
@@ -91,10 +91,10 @@ def AddEmp():
     try:
         conn = get_db_connection()
         with conn.cursor() as cursor:
-          cursor.execute("""
-            (insert_sql, (emp_id, first_name, last_name, pri_skill, location)
-            VALUES (%s, %s, %s, %s, %s)
-""", (empid, fname, lname, pri_skill, location))
+ cursor.execute("""
+    INSERT INTO employee (empid, fname, lname, pri_skill, location)
+    VALUES (%s, %s, %s, %s, %s)
+""", (empid, fname, lname, skill, location))
         conn.commit()
         emp_name = f"{first_name} {last_name}"
 
